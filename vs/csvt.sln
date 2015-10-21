@@ -1,0 +1,25 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio 2013
+VisualStudioVersion = 12.0.40629.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "frankenTracking", "frankenTracking.vcxproj", "{11D5849C-B7F5-41D6-8025-D0DB455A7578}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Win32 = Debug|Win32
+		Debug|x64 = Debug|x64
+		Release|Win32 = Release|Win32
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{11D5849C-B7F5-41D6-8025-D0DB455A7578}.Debug|Win32.ActiveCfg = Debug|Win32
+		{11D5849C-B7F5-41D6-8025-D0DB455A7578}.Debug|Win32.Build.0 = Debug|Win32
+		{11D5849C-B7F5-41D6-8025-D0DB455A7578}.Debug|x64.ActiveCfg = Debug|x64
+		{11D5849C-B7F5-41D6-8025-D0DB455A7578}.Release|Win32.ActiveCfg = Release|Win32
+		{11D5849C-B7F5-41D6-8025-D0DB455A7578}.Release|Win32.Build.0 = Release|Win32
+		{11D5849C-B7F5-41D6-8025-D0DB455A7578}.Release|x64.ActiveCfg = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal

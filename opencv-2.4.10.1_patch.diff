@@ -1,0 +1,1959 @@
+diff -ur opencv-2.4.4/modules/gpu/include/opencv2/gpu/gpu.hpp opencv/modules/gpu/include/opencv2/gpu/gpu.hpp
+--- opencv-2.4.4/modules/gpu/include/opencv2/gpu/gpu.hpp	2013-03-01 15:44:17.000000000 +0000
++++ opencv/modules/gpu/include/opencv2/gpu/gpu.hpp	2015-07-20 14:43:20.773425700 +0100
+@@ -1243,13 +1243,15 @@
+ {
+     enum { DEFAULT_WIN_SIGMA = -1 };
+     enum { DEFAULT_NLEVELS = 64 };
+-    enum { DESCR_FORMAT_ROW_BY_ROW, DESCR_FORMAT_COL_BY_COL };
++    enum { DESCR_FORMAT_ROW_BY_ROW, DESCR_FORMAT_COL_BY_COL, DESCR_FORMAT_MATRIX_ONLY };
++	enum { NORM_L2Hys=0, NORM_L1Sqrt=1 };
+ 
+     HOGDescriptor(Size win_size=Size(64, 128), Size block_size=Size(16, 16),
+                   Size block_stride=Size(8, 8), Size cell_size=Size(8, 8),
+                   int nbins=9, double win_sigma=DEFAULT_WIN_SIGMA,
+                   double threshold_L2hys=0.2, bool gamma_correction=true,
+-                  int nlevels=DEFAULT_NLEVELS);
++                  int nlevels=DEFAULT_NLEVELS, int histogram_norm_type=NORM_L2Hys,
++				  bool hist_bins_range_is_360deg = false);
+ 
+     size_t getDescriptorSize() const;
+     size_t getBlockHistogramSize() const;
+@@ -1270,16 +1272,30 @@
+                           int group_threshold=2);
+ 
+     void computeConfidence(const GpuMat& img, vector<Point>& hits, double hit_threshold,
+-                                                Size win_stride, Size padding, vector<Point>& locations, vector<double>& confidences);
++                                                Size win_stride, Size padding, vector<float>& weights);
+ 
+     void computeConfidenceMultiScale(const GpuMat& img, vector<Rect>& found_locations,
+                                                                     double hit_threshold, Size win_stride, Size padding,
+-                                                                    vector<HOGConfidence> &conf_out, int group_threshold);
++                                                                    vector<float>& weights, int group_threshold=2,double scale0=1.05);
++
++	//CB added computeConfidenceFromCells()
++	void computeConfidenceFromCells(const GpuMat& hist_cells, vector<Point>& hits, 
++				double hit_threshold, Size win_stride, Size padding,
++				int rows, int cols, vector<float>& weights);
+ 
+     void getDescriptors(const GpuMat& img, Size win_stride,
+                         GpuMat& descriptors,
+                         int descr_format=DESCR_FORMAT_COL_BY_COL);
+ 
++	//CB added extraction of descriptors from cells
++	void getDescriptorsFromCells(const GpuMat& cell_hists, Size win_stride,  
++						Size img_size, GpuMat& descriptors, 
++						int descr_format=DESCR_FORMAT_COL_BY_COL);
++
++	//CB added method for re-setting constants in gpu constant memory when used with
++	//detectors for different objects
++	void reUploadConstants(void);
++
+     Size win_size;
+     Size block_size;
+     Size block_stride;
+@@ -1289,6 +1305,9 @@
+     double threshold_L2hys;
+     bool gamma_correction;
+     int nlevels;
++	
++	int histogram_norm_type; //normalisation method, either L2Hys or L1Sqrt
++	bool hist_bin_range_is_360deg; //use 180 or 360deg for bin range
+ 
+ protected:
+     void computeBlockHistograms(const GpuMat& img);
+
+diff -ur opencv-2.4.4/modules/gpu/src/cuda/hog.cu opencv/modules/gpu/src/cuda/hog.cu
+--- opencv-2.4.4/modules/gpu/src/cuda/hog.cu	2013-03-01 15:44:17.000000000 +0000
++++ opencv/modules/gpu/src/cuda/hog.cu	2015-07-20 14:43:20.777429700 +0100
+@@ -66,6 +66,7 @@
+         __constant__ int cblock_hist_size_2up;
+         __constant__ int cdescr_size;
+         __constant__ int cdescr_width;
++		__constant__ float cangle_bin_bias_value;
+ 
+ 
+         /* Returns the nearest upper power of two, works only for
+@@ -88,7 +89,7 @@
+ 
+ 
+         void set_up_constants(int nbins, int block_stride_x, int block_stride_y,
+-                              int nblocks_win_x, int nblocks_win_y)
++                              int nblocks_win_x, int nblocks_win_y, bool hist_bin_range_is_360deg)
+         {
+             cudaSafeCall( cudaMemcpyToSymbol(cnbins, &nbins, sizeof(nbins)) );
+             cudaSafeCall( cudaMemcpyToSymbol(cblock_stride_x, &block_stride_x, sizeof(block_stride_x)) );
+@@ -107,6 +108,9 @@
+ 
+             int descr_size = descr_width * nblocks_win_y;
+             cudaSafeCall( cudaMemcpyToSymbol(cdescr_size, &descr_size, sizeof(descr_size)) );
++
++			float angle_bias_value = hist_bin_range_is_360deg? 0.0f : CV_PI_F;
++            cudaSafeCall( cudaMemcpyToSymbol(cangle_bin_bias_value, &angle_bias_value, sizeof(angle_bias_value)) );
+         }
+ 
+ 
+@@ -189,6 +193,10 @@
+             int tid = (cell_y * CELLS_PER_BLOCK_Y + cell_x) * 16 + cell_thread_x;
+             if (tid < cblock_hist_size)
+                 block_hist[tid] = final_hist[block_x * cblock_hist_size + tid];
++			int n_extra_block_bins = max(0, cblock_hist_size - blockDim.x*blockDim.y); 
++			if (tid< n_extra_block_bins  ) //handle blocks >64 in length. this is kind of inefficient, dont care
++				block_hist[blockDim.x*blockDim.y +tid]  = final_hist[block_x * cblock_hist_size +blockDim.x*blockDim.y+ tid];
++
+         }
+ 
+ 
+@@ -222,6 +230,82 @@
+             cudaSafeCall( cudaDeviceSynchronize() );
+         }
+ 
++//CB added compute_block_hists_from_cells kernel
++	template <int nblocks> // Number of histogram blocks processed by single GPU thread block
++	__global__ void compute_block_hists_from_cells_kernel(const int img_block_width, const int img_block_height,
++		const PtrStepf cell_hists, float* block_hists)
++	{ 
++		//PtrStepf in header may have to change
++		const int cell_x = threadIdx.x;
++		const int cell_y = threadIdx.y;
++		const int cell_bin = threadIdx.z;
++
++		//check if within grid
++		if (blockIdx.x >= img_block_width||
++			blockIdx.y >= img_block_height)
++			return;
++		//check if within histogram
++		if (cell_x >= CELLS_PER_BLOCK_X || cell_y >= CELLS_PER_BLOCK_Y || cell_bin >= cnbins)
++			return;
++
++		//block_hists is a (img_block_width * img_block_height * cnbins(36)) vector,
++		//row-major (ie y*width +x *xsize + nbin)
++		//get base of current block: buffer offset * 36
++		float* block_hist = block_hists + (blockIdx.y * img_block_width + blockIdx.x ) * cblock_hist_size; 
++		//get histogram bin [0-35] ->celly*16 + cellx * 8 + cell_bin
++		int tid = (cell_y * CELLS_PER_BLOCK_Y + cell_x) * cnbins+ cell_bin;
++
++		if (tid < cblock_hist_size) // tid < 36
++		{
++			//index into orig cell array using blockX and blockY
++
++			/*size of 1 cell - assume 16bit passed in * num of cells in a row (=blocks in row + 1)*/
++			const int offset_y = (blockIdx.y + cell_y) * cnbins * 1 * (img_block_width+1); 
++			//constant will be 1 or 2 or 4 all the time depending on relative sizes
++			const int offset_x = (blockIdx.x + cell_x) * cnbins * 1;
++
++			block_hist[tid] = cell_hists.data[offset_y + offset_x + cell_bin];//original cell hist
++			//TODO use shared mem here instead: could probably write into a cblock_hist_size-long thing
++			//and then update external memory
++			//TODO check state of coalesced writes etc
++			//eg
++			// __shared__ float smem[cblock_hist_size];
++			//smem[tid] = calculation;
++			//__syncthreads();
++			//block_hist[tid] = smem[tid];
++			
++		}
++	}
++
++	//CB added compute_block_hists_from_cell() wrapper
++	void compute_block_hists_from_cell(int nbins, int block_stride_x, int block_stride_y,
++		int height, int width, const PtrStepSzf& cell_hists, float* block_hists)
++	{
++		const int nblocks = 1;
++
++		int img_block_width = (width - CELLS_PER_BLOCK_X * CELL_WIDTH + block_stride_x) / 
++			block_stride_x;
++		int img_block_height = (height - CELLS_PER_BLOCK_Y * CELL_HEIGHT + block_stride_y) / 
++			block_stride_y;
++		//May need to include the -1 here as we strip LRUD borders from frame thus ncells and nblocks reduced by 1
++
++		dim3 grid(divUp(img_block_width, nblocks), img_block_height);
++		// this gives us  grid( (imwidth/blocksize), imheight/blocksize, 1)
++		//set thread as threads(2,2,9)
++		dim3 threads(CELLS_PER_BLOCK_Y, CELLS_PER_BLOCK_X, nbins);
++		//dunno what this does so commenting out for now
++		//cudaSafeCall(cudaFuncSetCacheConfig(compute_block_hists_from_cells_kernel<nblocks>, 
++		//                                  cudaFuncCachePreferL1));
++
++		int hists_size = (nbins * CELLS_PER_BLOCK_X * CELLS_PER_BLOCK_Y * 12 * nblocks) * sizeof(float);
++		int final_hists_size = (nbins * CELLS_PER_BLOCK_X * CELLS_PER_BLOCK_Y * nblocks) * sizeof(float);
++		int smem = hists_size + final_hists_size;
++		compute_block_hists_from_cells_kernel<nblocks><<<grid, threads, smem>>>(
++			img_block_width, img_block_height, cell_hists, block_hists);
++		cudaSafeCall( cudaGetLastError() );
++		cudaSafeCall( cudaDeviceSynchronize() );
++	}
++
+ 
+         //-------------------------------------------------------------
+         //  Normalization of histograms via L2Hys_norm
+@@ -291,9 +375,41 @@
+                 hist[0] = elem * scale;
+         }
+ 
++		//uses Dalal's L1-sqrt norm instead of L2-Hys. Possibly change the epsilon value
++		template <int nthreads, // Number of threads which process one block historgam
++			int nblocks> // Number of block hisograms processed by one GPU thread block
++		__global__ void normalize_hists_kernel_l1sqrt(
++			const int block_hist_size, const int img_block_width, float* block_hists, float threshold)
++		{
++			if (blockIdx.x * blockDim.z + threadIdx.z >= img_block_width)
++				return;
++
++			float* hist = block_hists + (blockIdx.y * img_block_width +
++				blockIdx.x * blockDim.z + threadIdx.z) *
++				block_hist_size + threadIdx.x;
++
++			__shared__ float sh_squares[nthreads * nblocks];
++			float* squares = sh_squares + threadIdx.z * nthreads;
++
++			float elem = 0.f;
++			if (threadIdx.x < block_hist_size)
++				elem = hist[0];
++			//14/8/13 changed to actually do a L1-sqrt norm instead of L2-sqrt
++			float sum = reduce_smem<nthreads>(squares, elem); 
++
++			//bit of a question over epsilon-value for this. looks like fpga-version uses 0.5, matlab version uses 1. opencv usually uses 0.1*block_hist_size
++			//float scale = 1.0f / (::sqrtf(sum) + 0.1f * block_hist_size);
++			//float scale = 1.0f / (::sqrtf(sum) + 1.0f/*0.5f*/);
++			float scale = 1.0f / (sum + 1.0f/*0.5f*/);
++
++			if (threadIdx.x < block_hist_size)
++				hist[0] = ::sqrtf(elem * scale);
++		}
++
+ 
+         void normalize_hists(int nbins, int block_stride_x, int block_stride_y,
+-                             int height, int width, float* block_hists, float threshold)
++                             int height, int width, float* block_hists, float threshold, 
++							 int norm_method, const int l1sqrt_norm_method)
+         {
+             const int nblocks = 1;
+ 
+@@ -305,19 +421,34 @@
+             int img_block_height = (height - CELLS_PER_BLOCK_Y * CELL_HEIGHT + block_stride_y) / block_stride_y;
+             dim3 grid(divUp(img_block_width, nblocks), img_block_height);
+ 
+-            if (nthreads == 32)
+-                normalize_hists_kernel_many_blocks<32, nblocks><<<grid, threads>>>(block_hist_size, img_block_width, block_hists, threshold);
+-            else if (nthreads == 64)
+-                normalize_hists_kernel_many_blocks<64, nblocks><<<grid, threads>>>(block_hist_size, img_block_width, block_hists, threshold);
+-            else if (nthreads == 128)
+-                normalize_hists_kernel_many_blocks<64, nblocks><<<grid, threads>>>(block_hist_size, img_block_width, block_hists, threshold);
+-            else if (nthreads == 256)
+-                normalize_hists_kernel_many_blocks<256, nblocks><<<grid, threads>>>(block_hist_size, img_block_width, block_hists, threshold);
+-            else if (nthreads == 512)
+-                normalize_hists_kernel_many_blocks<512, nblocks><<<grid, threads>>>(block_hist_size, img_block_width, block_hists, threshold);
+-            else
+-                cv::gpu::error("normalize_hists: histogram's size is too big, try to decrease number of bins", __FILE__, __LINE__, "normalize_hists");
+-
++			if (norm_method == l1sqrt_norm_method) { //cant really see a smarter way to do this other than pass in the enum for comparison here
++				if (nthreads == 32)
++					normalize_hists_kernel_l1sqrt<32, nblocks><<<grid, threads>>>(block_hist_size, img_block_width, block_hists, threshold);
++				else if (nthreads == 64)
++					normalize_hists_kernel_l1sqrt<64, nblocks><<<grid, threads>>>(block_hist_size, img_block_width, block_hists, threshold);
++				else if (nthreads == 128)
++					normalize_hists_kernel_l1sqrt<128, nblocks><<<grid, threads>>>(block_hist_size, img_block_width, block_hists, threshold);
++				else if (nthreads == 256)
++					normalize_hists_kernel_l1sqrt<256, nblocks><<<grid, threads>>>(block_hist_size, img_block_width, block_hists, threshold);
++				else if (nthreads == 512)
++					normalize_hists_kernel_l1sqrt<512, nblocks><<<grid, threads>>>(block_hist_size, img_block_width, block_hists, threshold);
++				else
++					cv::gpu::error("normalize_hists: histogram's size is too big, try to decrease number of bins", __FILE__, __LINE__, "normalize_hists");
++			} 
++			else {
++				if (nthreads == 32)
++					normalize_hists_kernel_many_blocks<32, nblocks><<<grid, threads>>>(block_hist_size, img_block_width, block_hists, threshold);
++				else if (nthreads == 64)
++					normalize_hists_kernel_many_blocks<64, nblocks><<<grid, threads>>>(block_hist_size, img_block_width, block_hists, threshold);
++				else if (nthreads == 128)
++					normalize_hists_kernel_many_blocks<128, nblocks><<<grid, threads>>>(block_hist_size, img_block_width, block_hists, threshold);
++				else if (nthreads == 256)
++					normalize_hists_kernel_many_blocks<256, nblocks><<<grid, threads>>>(block_hist_size, img_block_width, block_hists, threshold);
++				else if (nthreads == 512)
++					normalize_hists_kernel_many_blocks<512, nblocks><<<grid, threads>>>(block_hist_size, img_block_width, block_hists, threshold);
++				else
++					cv::gpu::error("normalize_hists: histogram's size is too big, try to decrease number of bins", __FILE__, __LINE__, "normalize_hists");
++			}
+             cudaSafeCall( cudaGetLastError() );
+ 
+             cudaSafeCall( cudaDeviceSynchronize() );
+@@ -386,6 +517,7 @@
+            compute_confidence_hists_kernel_many_blocks<nthreads, nblocks><<<grid, threads>>>(
+                    img_win_width, img_block_width, win_block_stride_x, win_block_stride_y,
+                    block_hists, coefs, free_coef, threshold, confidences);
++		   cudaSafeCall( cudaGetLastError() );
+            cudaSafeCall(cudaThreadSynchronize());
+        }
+ 
+@@ -641,7 +773,8 @@
+ 
+                 mag0 = ::sqrtf(mag0);
+ 
+-                float ang = (::atan2f(best_dy, best_dx) + CV_PI_F) * angle_scale - 0.5f;
++                //float ang = (::atan2f(best_dy, best_dx) + CV_PI_F) * angle_scale - 0.5f; //change to match cpu version
++				float ang = (::atan2f(best_dy, best_dx) + cangle_bin_bias_value) * angle_scale - 0.5f;
+                 int hidx = (int)::floorf(ang);
+                 ang -= hidx;
+                 hidx = (hidx + cnbins) % cnbins;
+@@ -714,7 +847,8 @@
+                 }
+                 float mag = ::sqrtf(dx * dx + dy * dy);
+ 
+-                float ang = (::atan2f(dy, dx) + CV_PI_F) * angle_scale - 0.5f;
++                //float ang = (::atan2f(dy, dx) + CV_PI_F) * angle_scale - 0.5f; //change to match cpu version
++				float ang = (::atan2f(dy, dx) + cangle_bin_bias_value) * angle_scale - 0.5f;
+                 int hidx = (int)::floorf(ang);
+                 ang -= hidx;
+                 hidx = (hidx + cnbins) % cnbins;
+
+diff -ur opencv-2.4.4/modules/gpu/src/hog.cpp opencv/modules/gpu/src/hog.cpp
+--- opencv-2.4.4/modules/gpu/src/hog.cpp	2013-03-01 15:44:17.000000000 +0000
++++ opencv/modules/gpu/src/hog.cpp	2015-07-20 14:43:20.780469300 +0100
+@@ -41,10 +41,11 @@
+ //M*/
+ 
+ #include "precomp.hpp"
++#include <stdio.h>
+ 
+ #if !defined (HAVE_CUDA) || defined (CUDA_DISABLER)
+ 
+-cv::gpu::HOGDescriptor::HOGDescriptor(Size, Size, Size, Size, int, double, double, bool, int) { throw_nogpu(); }
++cv::gpu::HOGDescriptor::HOGDescriptor(Size, Size, Size, Size, int, double, double, bool, int, int, bool) { throw_nogpu(); }
+ size_t cv::gpu::HOGDescriptor::getDescriptorSize() const { throw_nogpu(); return 0; }
+ size_t cv::gpu::HOGDescriptor::getBlockHistogramSize() const { throw_nogpu(); return 0; }
+ double cv::gpu::HOGDescriptor::getWinSigma() const { throw_nogpu(); return 0; }
+@@ -54,11 +54,14 @@
+ void cv::gpu::HOGDescriptor::detectMultiScale(const GpuMat&, vector<Rect>&, double, Size, Size, double, int) { throw_nogpu(); }
+ void cv::gpu::HOGDescriptor::computeBlockHistograms(const GpuMat&) { throw_nogpu(); }
+ void cv::gpu::HOGDescriptor::getDescriptors(const GpuMat&, Size, GpuMat&, int) { throw_nogpu(); }
++void cv::gpu::HOGDescriptor::getDescriptorsFromCells(const GpuMat&, Size, Size, GpuMat&, int) { throw_nogpu(); }
+ std::vector<float> cv::gpu::HOGDescriptor::getDefaultPeopleDetector() { throw_nogpu(); return std::vector<float>(); }
+ std::vector<float> cv::gpu::HOGDescriptor::getPeopleDetector48x96() { throw_nogpu(); return std::vector<float>(); }
+ std::vector<float> cv::gpu::HOGDescriptor::getPeopleDetector64x128() { throw_nogpu(); return std::vector<float>(); }
+-void cv::gpu::HOGDescriptor::computeConfidence(const GpuMat&, vector<Point>&, double, Size, Size, vector<Point>&, vector<double>&) { throw_nogpu(); }
+-void cv::gpu::HOGDescriptor::computeConfidenceMultiScale(const GpuMat&, vector<Rect>&, double, Size, Size, vector<HOGConfidence>&, int) { throw_nogpu(); }
++void cv::gpu::HOGDescriptor::computeConfidence(const GpuMat&, vector<Point>&, double, Size, Size, vector<float>&) { throw_nogpu(); }
++void cv::gpu::HOGDescriptor::computeConfidenceMultiScale(const GpuMat&, vector<Rect>&, double, Size, Size, vector<float>&, int, double) { throw_nogpu(); }
++void cv::gpu::HOGDescriptor::computeConfidenceFromCells(const GpuMat&, vector<Point>&, double, Size, Size, int, int, vector<float>& ) { throw_nogpu(); }
++void cv::gpu::HOGDescriptor::reUploadConstants(void) { throw_nogpu(); }
+ 
+ #else
+ 
+@@ -67,14 +70,20 @@
+     namespace hog
+     {
+         void set_up_constants(int nbins, int block_stride_x, int block_stride_y,
+-                              int nblocks_win_x, int nblocks_win_y);
++                              int nblocks_win_x, int nblocks_win_y, bool hist_bin_range_is_360deg);
+ 
+-        void compute_hists(int nbins, int block_stride_x, int blovck_stride_y,
++        void compute_hists(int nbins, int block_stride_x, int block_stride_y,
+                            int height, int width, const cv::gpu::PtrStepSzf& grad,
+                            const cv::gpu::PtrStepSzb& qangle, float sigma, float* block_hists);
++						   
++		void compute_block_hists_from_cell(int nbins, int block_stride_x, int block_stride_y,
++										   int height, int width, const PtrStepSzf& cell_hists, 
++										   float* block_hists);
+ 
+         void normalize_hists(int nbins, int block_stride_x, int block_stride_y,
+-                             int height, int width, float* block_hists, float threshold);
++                             int height, int width, float* block_hists, float threshold,
++							 int norm_method=cv::gpu::HOGDescriptor::NORM_L2Hys,
++							 const int l1sqrt_norm_method = cv::gpu::HOGDescriptor::NORM_L2Hys);
+ 
+         void classify_hists(int win_height, int win_width, int block_stride_y,
+                             int block_stride_x, int win_stride_y, int win_stride_x, int height,
+@@ -104,8 +113,37 @@
+ 
+ using namespace ::cv::gpu::device;
+ 
++//cb debug - dump a matrix fo type matType( usually CV-32FC1) to file filename and/or console
++
++	inline void dumpCellHistMat(const cv::Mat _mat, int matType, const char* filename, bool dumpToConsole){
++		FILE* fh;
++		if (_mat.type() !=CV_32FC1)
++			printf("Block histogram type is wrong. Specified type is %d and matrix type is  %d, isContinuous? %s\n",
++			matType, _mat.type(), _mat.isContinuous()? "true" : "false");
++		if (filename != NULL){
++			if (!(fh= fopen(filename,"w")))
++				printf("Failed opening histsdump file %s\n",filename);
++		}
++		if (fh ||dumpToConsole)
++		{
++			for (int kk=0;kk < _mat.rows; ++kk){
++				for (int jj=0;jj < _mat.cols; ++jj){
++					if (fh)				fprintf(fh, "%f\n",_mat.ptr<float>(kk)[jj]);
++					if (dumpToConsole)	printf("%f ",_mat.ptr<float>(kk)[jj]);
++				}
++				if (dumpToConsole)	printf("\n");
++			}
++			if (fh)
++				fclose(fh);
++		}
++	}
++
++
++
+ cv::gpu::HOGDescriptor::HOGDescriptor(Size win_size_, Size block_size_, Size block_stride_, Size cell_size_,
+-                                      int nbins_, double win_sigma_, double threshold_L2hys_, bool gamma_correction_, int nlevels_)
++                                      int nbins_, double win_sigma_, double threshold_L2hys_, 
++									  bool gamma_correction_, int nlevels_, int histogram_norm_type_,
++									  bool hist_bin_range_is_360deg_)
+         : win_size(win_size_),
+           block_size(block_size_),
+           block_stride(block_stride_),
+@@ -114,7 +152,9 @@
+           win_sigma(win_sigma_),
+           threshold_L2hys(threshold_L2hys_),
+           gamma_correction(gamma_correction_),
+-          nlevels(nlevels_)
++          nlevels(nlevels_),
++		  histogram_norm_type(histogram_norm_type_),
++		  hist_bin_range_is_360deg(hist_bin_range_is_360deg_)
+ {
+     CV_Assert((win_size.width  - block_size.width ) % block_stride.width  == 0 &&
+               (win_size.height - block_size.height) % block_stride.height == 0);
+@@ -129,7 +169,10 @@
+     CV_Assert(cells_per_block == Size(2, 2));
+ 
+     cv::Size blocks_per_win = numPartsWithin(win_size, block_size, block_stride);
+-    hog::set_up_constants(nbins, block_stride.width, block_stride.height, blocks_per_win.width, blocks_per_win.height);
++
++	//compute_gradients needs to add a value to the angle it gets from atan2.
++	//with unsigned bins (0-180deg) this is pi. with signed(0-360) bins this is zero.
++    hog::set_up_constants(nbins, block_stride.width, block_stride.height, blocks_per_win.width, blocks_per_win.height, hist_bin_range_is_360deg);
+ }
+ 
+ size_t cv::gpu::HOGDescriptor::getDescriptorSize() const
+@@ -205,8 +248,9 @@
+ 
+     //   qangle.create(img.size(), CV_8UC2);
+     _qangle = getBuffer(img.size(), CV_8UC2, qangle_buf);
++	int bin_scaling = hist_bin_range_is_360deg? 2 : 1;
+ 
+-    float angleScale = (float)(nbins / CV_PI);
++    float angleScale = (float)(nbins / ( bin_scaling * CV_PI));
+     switch (img.type())
+     {
+         case CV_8UC1:
+@@ -233,7 +277,16 @@
+                         grad, qangle, (float)getWinSigma(), block_hists.ptr<float>());
+ 
+     hog::normalize_hists(nbins, block_stride.width, block_stride.height, img.rows, img.cols,
+-                         block_hists.ptr<float>(), (float)threshold_L2hys);
++						block_hists.ptr<float>(), (float)threshold_L2hys, histogram_norm_type,
++						NORM_L1Sqrt);
++	//testing code
++	static bool oneshot=false;
++	if(oneshot){
++		Mat testhists;
++		block_hists.download(testhists);
++		dumpCellHistMat(testhists,CV_32FC1,"gpuhistsdump_computeBlockHistograms.txt",false);
++		oneshot=false;
++	}
+ }
+ 
+ 
+@@ -259,13 +312,16 @@
+         hog::extract_descrs_by_cols(win_size.height, win_size.width, block_stride.height, block_stride.width,
+                                     win_stride.height, win_stride.width, img.rows, img.cols, block_hists.ptr<float>(), descriptors);
+         break;
++	case DESCR_FORMAT_MATRIX_ONLY:
++		block_hists.copyTo(descriptors);
++		break;
+     default:
+         CV_Error(CV_StsBadArg, "Unknown descriptor format");
+     }
+ }
+ 
+ void cv::gpu::HOGDescriptor::computeConfidence(const GpuMat& img, vector<Point>& hits, double hit_threshold,
+-                          Size win_stride, Size padding, vector<Point>& locations, vector<double>& confidences)
++                          Size win_stride, Size padding, vector<float>& weights)
+ {
+   CV_Assert(padding == Size(0, 0));
+ 
+@@ -292,70 +348,188 @@
+   float* vec = labels_host.ptr<float>();
+ 
+   // does not support roi for now..
+-  locations.clear();
+-  confidences.clear();
++  weights.clear();
+   for (int i = 0; i < wins_per_img.area(); i++)
+     {
+       int y = i / wins_per_img.width;
+       int x = i - wins_per_img.width * y;
+-      if (vec[i] >= hit_threshold)
+-   hits.push_back(Point(x * win_stride.width, y * win_stride.height));
+-
+-      Point pt(win_stride.width * x, win_stride.height * y);
+-      locations.push_back(pt);
+-      confidences.push_back((double)vec[i]);
++	  //note default behaviour of computeConfidence has been modified
++	  //to dump all windows set hit_threshold to eg -99
++	  if (vec[i] >= hit_threshold){
++		hits.push_back(Point(x * win_stride.width, y * win_stride.height));
++		weights.push_back((float)vec[i]); 
++	  }
+     }
+ }
+ 
++//CB added computeConfidenceFromCells
++void cv::gpu::HOGDescriptor::computeConfidenceFromCells(const GpuMat& cell_hists, vector<Point>& hits, double hit_threshold,
++	Size win_stride, Size padding, int rows, int cols, vector<float>& weights)
++{
++	CV_Assert(padding == Size(0, 0));
++	CV_Assert( cell_hists.type() == CV_32FC1);
++
++	hits.clear();
++	if (detector.empty())
++		return;
++
++	//contents of computeBlockHistograms(img);
++	size_t block_hist_size = getBlockHistogramSize();
++	Size blocks_per_img = numPartsWithin(Size(cols,rows), block_size, block_stride);
++
++	block_hists = getBuffer(1, static_cast<int>(block_hist_size * blocks_per_img.area()), CV_32F, block_hists_buf);
++	//cell mangling goes in here
++	hog::compute_block_hists_from_cell( nbins,  block_stride.width, block_stride.height,
++		rows, cols, cell_hists,  block_hists.ptr<float>());
++
++	//testing code
++	static bool oneshot=false;
++	if(oneshot){
++		Mat testhists;
++		block_hists.download(testhists);
++		dumpCellHistMat(testhists,CV_32FC1,"gpuhistsdump_FromCells.txt",false);
++		oneshot=false;
++	}
++
++	hog::normalize_hists(nbins, block_stride.width, block_stride.height, rows, cols, 
++		block_hists.ptr<float>(), (float)threshold_L2hys, histogram_norm_type, NORM_L1Sqrt);
++
++	//testing code
++	static bool oneshot2=false;
++	if(oneshot2){
++		Mat testhists;
++		block_hists.download(testhists);
++		dumpCellHistMat(testhists,CV_32FC1,"normgpuhistsdump_FromCells.txt",false);
++		oneshot2=false;
++	}
++
++	//end contents of computeBlockHistograms
++
++	if (win_stride == Size())
++		win_stride = block_stride;
++	else
++		CV_Assert(win_stride.width % block_stride.width == 0 &&
++		win_stride.height % block_stride.height == 0);
++
++	Size wins_per_img = numPartsWithin(Size(cols,rows), win_size, win_stride);
++	labels.create(1, wins_per_img.area(), CV_32F);
++
++	hog::compute_confidence_hists(win_size.height, win_size.width, block_stride.height, block_stride.width,
++		win_stride.height, win_stride.width, rows, cols, block_hists.ptr<float>(),
++		detector.ptr<float>(), (float)free_coef, (float)hit_threshold, labels.ptr<float>());
++
++	labels.download(labels_host);
++	float* vec = labels_host.ptr<float>();
++
++	//testing code
++	static bool oneshot3=false;
++	if(oneshot3){
++		Mat testhists;
++		block_hists.download(testhists);
++		dumpCellHistMat(testhists,CV_32FC1,"gpuscores_FromCells.txt",false);
++		oneshot3=false;
++	}
++
++	// does not support roi for now..
++	weights.clear();
++	for (int i = 0; i < wins_per_img.area(); i++)
++	{
++		int y = i / wins_per_img.width;
++		int x = i - wins_per_img.width * y;
++
++		//to dump all windows, set hit_threshold really -ve
++		//note default behaviour of computeConfidence has been modified
++		if (vec[i] >= hit_threshold){
++			hits.push_back(Point(x * win_stride.width, y * win_stride.height));
++			weights.push_back(vec[i]);
++		}
++	}
++}
++
++//cb: used to re-upload cosntants when working with multiple detectors with different properties,
++//all of which share the same constant space on the gpu
++void cv::gpu::HOGDescriptor::reUploadConstants(){
++	cv::Size blocks_per_win = numPartsWithin(win_size, block_size, block_stride);
++	hog::set_up_constants(nbins, block_stride.width, block_stride.height, blocks_per_win.width, blocks_per_win.height, hist_bin_range_is_360deg);
++}
++
+ void cv::gpu::HOGDescriptor::computeConfidenceMultiScale(const GpuMat& img, vector<Rect>& found_locations,
+-                            double hit_threshold, Size win_stride, Size padding,
+-                            vector<HOGConfidence> &conf_out, int group_threshold)
++	double hit_threshold, Size win_stride, Size padding,
++	vector<float> &weights, int group_threshold, double scale0)
+ {
+-    vector<double> level_scale;
+-    double scale = 1.;
+-    int levels = 0;
++	CV_Assert(img.type() == CV_8UC1 || img.type() == CV_8UC4);
+ 
+-    for (levels = 0; levels < (int)conf_out.size(); levels++)
+-    {
+-        scale = conf_out[levels].scale;
+-        level_scale.push_back(scale);
+-        if (cvRound(img.cols/scale) < win_size.width || cvRound(img.rows/scale) < win_size.height)
++	//multiple instances of HOG fight with each other in terms of constants so we force updates of constants on the gpu here.
++	//from now on, use detectMultiScale for less fannying about/higher speed
++	reUploadConstants();
++	/*cv::Size blocks_per_win = numPartsWithin(win_size, block_size, block_stride);
++	hog::set_up_constants(nbins, block_stride.width, block_stride.height, blocks_per_win.width, blocks_per_win.height, hist_bin_range_is_360deg);*/
++	/////////////////////////////////////////////
++	vector<double> level_scale;	
++	double scale = 1.;
++	int levels = 0;
++	
++	for (levels = 0; levels < nlevels; levels++)
++	{
++		level_scale.push_back(scale);
++        if (cvRound(img.cols/scale) < win_size.width ||
++            cvRound(img.rows/scale) < win_size.height || scale0 <= 1)
+             break;
+-    }
++        scale *= scale0;
++	}
+ 
+-    levels = std::max(levels, 1);
+-    level_scale.resize(levels);
+-
+-    std::vector<Rect> all_candidates;
+-    vector<Point> locations;
+-
+-    for (size_t i = 0; i < level_scale.size(); i++)
+-    {
+-        scale = level_scale[i];
+-        Size sz(cvRound(img.cols / scale), cvRound(img.rows / scale));
+-        GpuMat smaller_img;
+-
+-        if (sz == img.size())
+-            smaller_img = img;
+-        else
+-        {
+-            smaller_img.create(sz, img.type());
+-            switch (img.type())
+-            {
+-            case CV_8UC1: hog::resize_8UC1(img, smaller_img); break;
+-            case CV_8UC4: hog::resize_8UC4(img, smaller_img); break;
+-            }
+-        }
+-
+-        computeConfidence(smaller_img, locations, hit_threshold, win_stride, padding, conf_out[i].locations, conf_out[i].confidences);
+-
+-        Size scaled_win_size(cvRound(win_size.width * scale), cvRound(win_size.height * scale));
+-        for (size_t j = 0; j < locations.size(); j++)
+-            all_candidates.push_back(Rect(Point2d((CvPoint)locations[j]) * scale, scaled_win_size));
+-    }
+-
+-    found_locations.assign(all_candidates.begin(), all_candidates.end());
+-    groupRectangles(found_locations, group_threshold, 0.2/*magic number copied from CPU version*/);
++	levels = std::max(levels, 1);
++	level_scale.resize(levels);
++	
++	std::vector<Rect> all_candidates;
++	vector<Point> locations;
++	vector<int> weights_int;
++
++	for (size_t i = 0; i < level_scale.size(); i++)
++	{
++		scale = level_scale[i];
++		Size sz(cvRound(img.cols / scale), cvRound(img.rows / scale));
++		GpuMat smaller_img;
++		vector<float> level_weights;
++
++		if (sz == img.size())
++			smaller_img = img;
++		else
++		{
++			smaller_img.create(sz, img.type());
++			switch (img.type())
++			{
++			case CV_8UC1: hog::resize_8UC1(img, smaller_img); break;
++			case CV_8UC4: hog::resize_8UC4(img, smaller_img); break;
++			}
++		}
++		
++		computeConfidence(smaller_img, locations, hit_threshold, win_stride, padding, level_weights);
++
++		Size scaled_win_size(cvRound(win_size.width * scale), cvRound(win_size.height * scale));
++		for (size_t j = 0; j < locations.size(); j++){
++			all_candidates.push_back(Rect(Point2d((CvPoint)locations[j]) * scale, scaled_win_size));
++			weights.push_back(level_weights[j]);
++		}
++			
++	}
++
++	found_locations.assign(all_candidates.begin(), all_candidates.end());
++	//if VC++ bitches about next line put a transform() in here
++	//maybe make this ceil()
++	weights_int.assign(weights.begin(),weights.end());
++	/*bool use_meanshift = false;
++	if (use_meanshift){
++	//extract out locations and confidences from HOGConfidence
++		groupRectangles_meanshift(found_locations, weights, cand_scales, group_threshold, win_size);
++		score.clear();
++		score.assign(cand_scores.begin(),cand_scores.end());
++	}
++	else*/
++	//expanded to return weights as well
++		groupRectangles(found_locations, weights_int,group_threshold, 0.2/*magic number copied from CPU version*/);
++		if (group_threshold!=0)
++			weights.assign(weights_int.begin(),weights_int.end());
+ }
+ 
+ 
+@@ -394,6 +568,58 @@
+     }
+ }
+ 
++void cv::gpu::HOGDescriptor::getDescriptorsFromCells(const GpuMat& cell_hists, Size win_stride,  Size img_size, GpuMat& descriptors, int descr_format)
++{
++	CV_Assert( cell_hists.type() == CV_32FC1);
++
++	if (detector.empty())
++		return;
++	// contents of computeBlockHistograms(img);
++	size_t block_hist_size = getBlockHistogramSize();
++
++	Size blocks_per_img = numPartsWithin(img_size, block_size, block_stride);
++
++	//   block_hists.create(1, block_hist_size * blocks_per_img.area(), CV_32F);
++	block_hists = getBuffer(1, static_cast<int>(block_hist_size * blocks_per_img.area()), CV_32F, block_hists_buf);
++	//cell mangling goes in here
++	hog::compute_block_hists_from_cell( nbins,  block_stride.width, block_stride.height,
++		img_size.height, img_size.width, cell_hists,  block_hists.ptr<float>());
++
++	//testing code
++	static bool oneshot2=false;
++	if(oneshot2){
++		Mat testhists;
++		block_hists.download(testhists);
++		dumpCellHistMat(testhists,CV_32FC1,"gpuhistsdump_getDescriptors.txt",false);
++		oneshot2=false;
++	}
++
++	hog::normalize_hists(nbins, block_stride.width, block_stride.height, img_size.height, img_size.width, 
++		block_hists.ptr<float>(), (float)threshold_L2hys, histogram_norm_type, NORM_L1Sqrt);
++
++
++    Size blocks_per_win = numPartsWithin(win_size, block_size, block_stride);
++    Size wins_per_img   = numPartsWithin(img_size, win_size, win_stride);
++
++    descriptors.create(wins_per_img.area(), static_cast<int>(blocks_per_win.area() * block_hist_size), CV_32F);
++
++    switch (descr_format)
++    {
++    case DESCR_FORMAT_ROW_BY_ROW:
++        hog::extract_descrs_by_rows(win_size.height, win_size.width, block_stride.height, block_stride.width,
++                                    win_stride.height, win_stride.width, img_size.height, img_size.width, block_hists.ptr<float>(), descriptors);
++        break;
++    case DESCR_FORMAT_COL_BY_COL:
++        hog::extract_descrs_by_cols(win_size.height, win_size.width, block_stride.height, block_stride.width,
++									win_stride.height, win_stride.width, img_size.height, img_size.width, block_hists.ptr<float>(), descriptors);
++        break;
++	case DESCR_FORMAT_MATRIX_ONLY:
++		block_hists.copyTo(descriptors);
++		break;
++    default:
++        CV_Error(CV_StsBadArg, "Unknown descriptor format");
++    }
++}
+ 
+ 
+ void cv::gpu::HOGDescriptor::detectMultiScale(const GpuMat& img, vector<Rect>& found_locations, double hit_threshold,
+
+diff -ur opencv-2.4.4/modules/highgui/include/opencv2/highgui/highgui.hpp opencv/modules/highgui/include/opencv2/highgui/highgui.hpp
+--- opencv-2.4.4/modules/highgui/include/opencv2/highgui/highgui.hpp	2013-03-01 15:44:17.000000000 +0000
++++ opencv/modules/highgui/include/opencv2/highgui/highgui.hpp	2015-07-20 14:43:20.788478900 +0100
+@@ -156,6 +156,9 @@
+ CV_EXPORTS int createButton( const string& bar_name, ButtonCallback on_change,
+                              void* userdata=NULL, int type=CV_PUSH_BUTTON,
+                              bool initial_button_state=0);
++//cb edit: -1 toggles, 0 or 1 clear or set. probably a good reason this wasnt exposed before...
++CV_EXPORTS int setButtonState( const string& button_name, int new_state=-1);
++
+ 
+ //-------------------------
+ 
+diff -ur opencv-2.4.4/modules/highgui/include/opencv2/highgui/highgui_c.h opencv/modules/highgui/include/opencv2/highgui/highgui_c.h
+--- opencv-2.4.4/modules/highgui/include/opencv2/highgui/highgui_c.h	2013-03-01 15:44:17.000000000 +0000
++++ opencv/modules/highgui/include/opencv2/highgui/highgui_c.h	2015-07-20 14:43:20.790441400 +0100
+@@ -84,6 +84,8 @@
+ typedef void (CV_CDECL *CvButtonCallback)(int state, void* userdata);
+ enum {CV_PUSH_BUTTON = 0, CV_CHECKBOX = 1, CV_RADIOBOX = 2};
+ CVAPI(int) cvCreateButton( const char* button_name CV_DEFAULT(NULL),CvButtonCallback on_change CV_DEFAULT(NULL), void* userdata CV_DEFAULT(NULL) , int button_type CV_DEFAULT(CV_PUSH_BUTTON), int initial_button_state CV_DEFAULT(0));
++//cb edit: -1 toggles, 0 or 1 clear or set checkbox. probably a good reason this wasnt exposed before...
++CVAPI(int) cvSetButtonState( const char* button_name CV_DEFAULT(NULL), int new_state CV_DEFAULT(-1));
+ //----------------------
+ 
+ 
+
+diff -ur opencv-2.4.4/modules/highgui/src/window.cpp opencv/modules/highgui/src/window.cpp
+--- opencv-2.4.4/modules/highgui/src/window.cpp	2013-03-01 15:44:17.000000000 +0000
++++ opencv/modules/highgui/src/window.cpp	2015-07-20 14:43:20.792441600 +0100
+@@ -398,6 +398,12 @@
+     return cvCreateButton(button_name.c_str(), on_change, userdata, button_type , initial_button_state );
+ }
+ 
++//cb edit
++int cv::setButtonState(const string& button_name, int new_state)
++{
++    return cvSetButtonState(button_name.c_str(), new_state);
++}
++
+ #else
+ 
+ CvFont cv::fontQt(const string&, int, Scalar, int,  int, int)
+@@ -617,6 +623,12 @@
+     return -1;
+ }
+ 
++CV_IMPL int cvSetButtonState(const char*, int)
++{
++    CV_NO_GUI_ERROR("cvSetButtonState");
++    return -1;
++}
++
+ 
+ #endif
+ 
+
+
+
+diff -ur opencv-2.4.4/modules/highgui/src/window_QT.cpp opencv/modules/highgui/src/window_QT.cpp
+--- opencv-2.4.4/modules/highgui/src/window_QT.cpp	2013-03-01 15:44:17.000000000 +0000
++++ opencv/modules/highgui/src/window_QT.cpp	2015-07-20 14:43:20.795443500 +0100
+@@ -619,6 +619,24 @@
+     return 1;//dummy value
+ }
+ 
++//cb edit
++CV_IMPL int cvSetButtonState(const char* button_name, int new_state)
++{
++    if (!guiMainThread)
++        CV_Error( CV_StsNullPtr, "NULL guiReceiver (please create a window)" );
++
++    if (new_state  < -1 || new_state > 1)
++        return 0;
++
++    QMetaObject::invokeMethod(guiMainThread,
++        "setButtonState",
++        Qt::AutoConnection,
++        Q_ARG(QString, QString(button_name)),
++        Q_ARG(int,  new_state));
++
++    return 1;//dummy value
++}
++
+ 
+ CV_IMPL int cvGetTrackbarPos(const char* name_bar, const char* window_name)
+ {
+@@ -1080,6 +1098,25 @@
+     b->addButton(button_name, (CvButtonCallback) on_change, userdata, button_type, initial_button_state);
+ }
+ 
++void GuiReceiver::setButtonState(QString button_name, int new_state)
++{
++    if (!global_control_panel)
++        return;
++
++    QPointer<CvButtonbar> b;
++
++	int nbars = global_control_panel->myLayout->count();
++	for (int i=0;i<nbars;i++){ //search for correct buttton over all bars
++		CvBar* thisbar = (CvBar*) global_control_panel->myLayout->itemAt(i);
++		if (thisbar->type == type_CvButtonbar){
++			b = (CvButtonbar*) thisbar;
++			//search b for a button with given name and attempt to set its state
++			if (b->setButtonState(button_name, new_state))
++				return; //returns true if found
++		}
++	}
++}
++
+ 
+ void GuiReceiver::addSlider2(QString bar_name, QString window_name, void* value, int count, void* on_change, void *userdata)
+ {
+@@ -1373,6 +1410,27 @@
+     }
+ }
+ 
++//cb edit
++bool CvButtonbar::setButtonState(QString name_button, int new_state)
++{
++	int nItems =count(); //layout()->?
++	bool found = false;
++
++	for (int i=0; i<nItems;i++){
++		QWidget* temp = (QWidget*)itemAt(i)->widget();
++		//maybe check if checkbox?
++		if (temp->objectName() == name_button){
++			CvCheckBox* button = (CvCheckBox*) temp;		
++			if (new_state == -1) //toggle
++				button->isChecked()? button->setChecked(0) : button->setChecked(1);
++			else //set 
++				button->setChecked(new_state);
++			return true;
++		}
++	}
++	return found; //not found
++}
++
+ 
+ //////////////////////////////////////////////////////
+ // Buttons
+diff -ur opencv-2.4.4/modules/highgui/src/window_QT.h opencv/modules/highgui/src/window_QT.h
+--- opencv-2.4.4/modules/highgui/src/window_QT.h	2013-03-01 15:44:17.000000000 +0000
++++ opencv/modules/highgui/src/window_QT.h	2015-07-20 14:43:20.797446100 +0100
+@@ -145,6 +145,9 @@
+     void updateWindow(QString name);
+     double isOpenGl(QString name);
+ 
++	//cb extension
++	void setButtonState(QString button_name, int new_state);
++
+ private:
+     int nb_windows;
+     bool doesExternalQAppExist;
+@@ -168,6 +171,8 @@
+     CvButtonbar(QWidget* arg, QString bar_name);
+ 
+     void addButton(QString button_name, CvButtonCallback call, void* userdata,  int button_type, int initial_button_state);
++	//cb extension
++	bool setButtonState(QString button_name, int new_state);
+ 
+ private:
+     void setLabel();
+
+
+
+
+
+
+
+
+
+
+diff -ur opencv-2.4.4/modules/objdetect/include/opencv2/objdetect/objdetect.hpp opencv/modules/objdetect/include/opencv2/objdetect/objdetect.hpp
+--- opencv-2.4.4/modules/objdetect/include/opencv2/objdetect/objdetect.hpp	2013-03-01 15:44:17.000000000 +0000
++++ opencv/modules/objdetect/include/opencv2/objdetect/objdetect.hpp	2015-07-20 14:43:20.805463000 +0100
+@@ -505,24 +505,25 @@
+ struct CV_EXPORTS_W HOGDescriptor
+ {
+ public:
+-    enum { L2Hys=0 };
++    enum { L2Hys=0, L1Sqrt=1 };
+     enum { DEFAULT_NLEVELS=64 };
+ 
+     CV_WRAP HOGDescriptor() : winSize(64,128), blockSize(16,16), blockStride(8,8),
+         cellSize(8,8), nbins(9), derivAperture(1), winSigma(-1),
+         histogramNormType(HOGDescriptor::L2Hys), L2HysThreshold(0.2), gammaCorrection(true),
+-        nlevels(HOGDescriptor::DEFAULT_NLEVELS)
++        nlevels(HOGDescriptor::DEFAULT_NLEVELS), histBinsRangeIs360Deg(false)
+     {}
+ 
+     CV_WRAP HOGDescriptor(Size _winSize, Size _blockSize, Size _blockStride,
+                   Size _cellSize, int _nbins, int _derivAperture=1, double _winSigma=-1,
+                   int _histogramNormType=HOGDescriptor::L2Hys,
+                   double _L2HysThreshold=0.2, bool _gammaCorrection=false,
+-                  int _nlevels=HOGDescriptor::DEFAULT_NLEVELS)
++                  int _nlevels=HOGDescriptor::DEFAULT_NLEVELS, bool _histBinsRangeIs360Deg = false)
+     : winSize(_winSize), blockSize(_blockSize), blockStride(_blockStride), cellSize(_cellSize),
+     nbins(_nbins), derivAperture(_derivAperture), winSigma(_winSigma),
+     histogramNormType(_histogramNormType), L2HysThreshold(_L2HysThreshold),
+-    gammaCorrection(_gammaCorrection), nlevels(_nlevels)
++    gammaCorrection(_gammaCorrection), nlevels(_nlevels), 
++	histBinsRangeIs360Deg(_histBinsRangeIs360Deg)
+     {}
+ 
+     CV_WRAP HOGDescriptor(const String& filename)
+@@ -575,6 +576,16 @@
+                                   double hitThreshold=0, Size winStride=Size(),
+                                   Size padding=Size(), double scale=1.05,
+                                   double finalThreshold=2.0, bool useMeanshiftGrouping = false) const;
++	//with found weights output
++    CV_WRAP virtual void detectFromCells(const Mat& cellhists, CV_OUT vector<Point>& foundLocations, 
++								  vector<double>& weights, Size imsz, double hitThreshold=0, 
++								  Size winStride=Size(), Size padding=Size(),
++                        		  const vector<Point>& searchLocations=vector<Point>()) const;
++	//without found weights output
++    CV_WRAP virtual void detectFromCells(const Mat& cellhists, CV_OUT vector<Point>& foundLocations,
++								  Size imsz, double hitThreshold=0,
++								  Size winStride=Size(), Size padding=Size(),
++								  const vector<Point>& searchLocations=vector<Point>()) const;
+ 
+     CV_WRAP virtual void computeGradient(const Mat& img, CV_OUT Mat& grad, CV_OUT Mat& angleOfs,
+                                  Size paddingTL=Size(), Size paddingBR=Size()) const;
+@@ -594,6 +605,7 @@
+     CV_PROP bool gammaCorrection;
+     CV_PROP vector<float> svmDetector;
+     CV_PROP int nlevels;
++	CV_PROP bool histBinsRangeIs360Deg; //180 (default) or 360deg range for histogram bins
+ 
+ 
+    // evaluate specified ROI and return confidence value for each location
+@@ -629,6 +623,9 @@
+    // read/parse Dalal's alt model file
+    void readALTModel(std::string modelfile);
+    void groupRectangles(vector<cv::Rect>& rectList, vector<double>& weights, int groupThreshold, double eps) const;
++    protected:	
++       void normalizeBlockHistogramFromCell(float* _hist, size_t blockHistogramSize) const;
++       Size windowsInImageCells(Size imageSize, Size winStride, Size winSize) const;
+ };
+ 
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+diff -ur opencv-2.4.4/modules/objdetect/src/hog.cpp opencv/modules/objdetect/src/hog.cpp
+--- opencv-2.4.4/modules/objdetect/src/hog.cpp	2013-03-01 15:44:17.000000000 +0000
++++ opencv/modules/objdetect/src/hog.cpp	2015-07-20 14:43:20.808455600 +0100
+@@ -45,6 +45,11 @@
+ #ifdef HAVE_IPP
+ #include "ipp.h"
+ #endif
++//hack to support tiny bits of sse2 optimisation until we update to a later OpenCV version
++#define USING_SSE2 1
++#ifdef USING_SSE2
++#include <xmmintrin.h>
++#endif
+ /****************************************************************************************\
+       The code below is implementation of HOG (Histogram-of-Oriented Gradients)
+       descriptor and object detection, introduced by Navneet Dalal and Bill Triggs.
+@@ -56,7 +61,29 @@
+ 
+ namespace cv
+ {
+-
++	//cb debug - dump a matrix of type matType( usually CV-32FC1) to file filename and/or console
++	inline void dumpCellHistMat(const Mat _mat, int matType, const string filename, bool dumpToConsole){
++		FILE* fh = 0;
++		if (_mat.type() !=CV_32FC1)
++			printf("Block histogram type is wrong. Specified type is %d and matrix type is  %d, isContinuous? %s\n",
++			matType, _mat.type(), _mat.isContinuous()? "true" : "false");
++		if (!filename.empty()){
++			if ((fh= fopen(filename.c_str(),"w"))==NULL)
++				printf("Failed opening histsdump file %s\n",filename.c_str());
++		}
++		if (fh ||dumpToConsole)
++		{
++			for (int kk=0;kk < _mat.rows; ++kk){
++				for (int jj=0;jj < _mat.cols; ++jj){
++					if (fh)				fprintf(fh, "%f\n",_mat.ptr<float>(kk)[jj]);
++					if (dumpToConsole)	printf("%f ",_mat.ptr<float>(kk)[jj]);
++				}
++				if (dumpToConsole)	printf("\n");
++			}
++			if (fh)
++				fclose(fh);
++		}
++	}
+ size_t HOGDescriptor::getDescriptorSize() const
+ {
+     CV_Assert(blockSize.width % cellSize.width == 0 &&
+@@ -169,6 +196,7 @@
+     c.gammaCorrection = gammaCorrection;
+     c.svmDetector = svmDetector;
+     c.nlevels = nlevels;
++	c.histBinsRangeIs360Deg = histBinsRangeIs360Deg;
+ }
+ 
+ void HOGDescriptor::computeGradient(const Mat& img, Mat& grad, Mat& qangle,
+@@ -220,7 +248,8 @@
+     Mat Angle(1, width, CV_32F, dbuf + width*3);
+ 
+     int _nbins = nbins;
+-    float angleScale = (float)(_nbins/CV_PI);
++	int bin_scaler = histBinsRangeIs360Deg ? 2 : 1;
++    float angleScale = (float)(_nbins/(bin_scaler * CV_PI));
+ #ifdef HAVE_IPP
+     Mat lutimg(img.rows,img.cols,CV_MAKETYPE(CV_32F,cn));
+     Mat hidxs(1, width, CV_32F);
+@@ -408,6 +437,7 @@
+ 
+     const float* getBlock(Point pt, float* buf);
+     virtual void normalizeBlockHistogram(float* histogram) const;
++	virtual void normalizeBlockHistogramL1sqrt(float* histogram) const;
+ 
+     vector<PixData> pixData;
+     vector<BlockData> blockData;
+@@ -449,13 +479,14 @@
+     cacheStride = _cacheStride;
+     useCache = _useCache;
+ 
+-    descriptor->computeGradient(_img, grad, qangle, _paddingTL, _paddingBR);
++	descriptor->computeGradient(_img, grad, qangle, _paddingTL, _paddingBR);
+     imgoffset = _paddingTL;
+ 
+     winSize = descriptor->winSize;
+     Size blockSize = descriptor->blockSize;
+     Size blockStride = descriptor->blockStride;
+     Size cellSize = descriptor->cellSize;
++		Size winSize = descriptor->winSize;
+     int i, j, nbins = descriptor->nbins;
+     int rawBlockSize = blockSize.width*blockSize.height;
+ 
+@@ -729,12 +760,76 @@
+         t1 = hist[h1] + a1*w;
+         hist[h0] = t0; hist[h1] = t1;
+     }
+-
+-    normalizeBlockHistogram(blockHist);
++	if (descriptor->histogramNormType == HOGDescriptor::L1Sqrt)
++		normalizeBlockHistogramL1sqrt(blockHist);
++	else
++		normalizeBlockHistogram(blockHist);
+ 
+     return blockHist;
+ }
+ 
++//CB: same as normalizeBlockHistogram from HOGCache but renamed and shoved into descriptor class
++//TODO l1Sqrt version if needed
++void HOGDescriptor::normalizeBlockHistogramFromCell(float* _hist, size_t blockHistogramSize) const
++{
++	float* hist = &_hist[0];
++#ifdef HAVE_IPP
++	size_t sz = blockHistogramSize;
++#else
++	size_t i, sz = blockHistogramSize;
++#endif
++	float sum = 0;
++	if (histogramNormType == HOGDescriptor::L2Hys){	
++#ifdef HAVE_IPP
++		ippsDotProd_32f(hist,hist,sz,&sum);
++#else
++		for( i = 0; i < sz; i++ )
++			sum += hist[i]*hist[i];
++#endif
++		float scale=0,thresh=0;
++		scale = 1.f/(std::sqrt(sum)+sz*0.1f);
++		thresh = (float)L2HysThreshold;
++#ifdef HAVE_IPP
++		ippsMulC_32f_I(scale,hist,sz);
++		ippsThreshold_32f_I( hist, sz, thresh, ippCmpGreater );
++		ippsDotProd_32f(hist,hist,sz,&sum);
++#else
++		for( i = 0, sum = 0; i < sz; i++ )
++		{
++			hist[i] = std::min(hist[i]*scale, thresh);
++			sum += hist[i]*hist[i];
++		}
++#endif
++
++		scale = 1.f/(std::sqrt(sum)+1e-3f);
++#ifdef HAVE_IPP
++		ippsMulC_32f_I(scale,hist,sz);
++#else
++		for( i = 0; i < sz; i++ )
++			hist[i] *= scale;
++#endif
++	}
++	else if (histogramNormType == HOGDescriptor::L1Sqrt){
++#ifdef HAVE_IPP
++		ippsSum_32f(hist,sz,&sum);
++#else
++		for( i = 0; i < sz; i++ )
++			sum += hist[i];
++#endif
++		float scale=0;
++		scale = 1.f/(sum+1.0f);
++#ifdef HAVE_IPP
++		ippsMulC_32f_I(scale,hist,sz);
++		ippsSqrt_32f_I(hist,sz);
++#else
++		for( i = 0;i < sz; i++ )
++		{
++			hist[i] = std::sqrt(hist[i]*scale);
++		}
++#endif
++	}
++}
++
+ 
+ void HOGCache::normalizeBlockHistogram(float* _hist) const
+ {
+@@ -775,6 +870,34 @@
+ #endif
+ }
+ 
++void HOGCache::normalizeBlockHistogramL1sqrt(float* _hist) const
++{
++    float* hist = &_hist[0];
++#ifdef HAVE_IPP
++    size_t sz = blockHistogramSize;
++#else
++    size_t i, sz = blockHistogramSize;
++#endif
++	//get l1-norm (just sum( _hist)), doesnt involve squares or square-roots
++    float sum = 0;
++#ifdef HAVE_IPP
++    ippsSum_32f(hist,sz,&sum);
++#else
++    for( i = 0; i < sz; i++ )
++        sum += hist[i];
++#endif
++
++    float scale = 1.f/(sum+1.0f);
++#ifdef HAVE_IPP
++    ippsMulC_32f_I(scale,hist,sz);
++	ippsSqrt_32f_I(hist,sz);
++#else
++    for( i = 0;i < sz; i++ )
++    {
++        hist[i] = std::sqrt(hist[i]*scale);
++    }
++#endif
++}
+ 
+ Size HOGCache::windowsInImage(Size imageSize, Size winStride) const
+ {
+@@ -852,6 +975,81 @@
+     }
+ }
+ 
++#ifdef USING_SSE2
++inline double classifySVMBlockWhenHistSzIs36(const float* svmVec, const float* vec){
++		int k=0;
++#ifdef WIN32
++		__declspec(align(16))
++#else
++		__attribute__ ((aligned(16)))
++#endif
++		    float partSum[4];
++		double s=0.f;
++		//nasty suspicion we'd need x64 for this to 
++		//work properly as we may not have enough registers to do this properly
++		//wonder how register spilling works here?
++		//this could do with a further look really
++		__m128 mulA,mulB,mulC,mulD,mulE,mulF,mulG,mulH,mulI;
++		__m128 sumA,sumB,sumC,sumD;
++		__m128 v1= _mm_loadu_ps(vec);
++		__m128 s1= _mm_loadu_ps(svmVec);
++		k+=4;
++		__m128 v2= _mm_loadu_ps(vec+k);
++		__m128 s2= _mm_loadu_ps(svmVec+k);
++		k+=4;
++		__m128 v3= _mm_loadu_ps(vec+k);
++		__m128 s3= _mm_loadu_ps(svmVec+k);
++		k+=4;
++		__m128 v4= _mm_loadu_ps(vec+k);
++		__m128 s4= _mm_loadu_ps(svmVec+k);
++		k+=4;
++		__m128 v5= _mm_loadu_ps(vec+k);
++		__m128 s5= _mm_loadu_ps(svmVec+k);
++		k+=4;
++		__m128 v6= _mm_loadu_ps(vec+k);
++		__m128 s6= _mm_loadu_ps(svmVec+k);
++		k+=4;
++		__m128 v7= _mm_loadu_ps(vec+k);
++		__m128 s7= _mm_loadu_ps(svmVec+k);
++		k+=4;
++		__m128 v8= _mm_loadu_ps(vec+k);
++		__m128 s8= _mm_loadu_ps(svmVec+k);
++		k+=4;
++		__m128 v9= _mm_loadu_ps(vec+k);
++		__m128 s9= _mm_loadu_ps(svmVec+k);
++
++		mulA = _mm_mul_ps(v1,s1);
++		mulB = _mm_mul_ps(v2,s2);
++		mulC = _mm_mul_ps(v3,s3);
++		
++		mulD = _mm_mul_ps(v4,s4);
++		mulE = _mm_mul_ps(v5,s5);
++		mulF = _mm_mul_ps(v6,s6);
++
++		mulG = _mm_mul_ps(v7,s7);
++		mulH = _mm_mul_ps(v8,s8);
++		mulI = _mm_mul_ps(v9,s9);
++
++		sumA = _mm_add_ps(mulA,mulB); //1 2
++		sumB = _mm_add_ps(mulC,mulD); //3 4
++		sumC = _mm_add_ps(mulE,mulF); //5 6
++		
++		sumD = _mm_add_ps(mulG,mulH); //7 8 
++		sumA = _mm_add_ps(mulI,sumA); //1 2 9
++
++		sumB = _mm_add_ps(sumB,sumC); //3 4 5 6
++		//reusing
++		sumA = _mm_add_ps(sumD,sumA); // 1 2 7 8 9
++
++		sumB = _mm_add_ps(sumA,sumB); // 1 2 3 4 5 6 7 8 9
++		_mm_store_ps(partSum,sumB);
++		//reduce
++		double t0 = partSum[0] + partSum[1];
++		double t1 = partSum[2] + partSum[3];
++		s += t0 + t1;
++		return s;		
++}
++#endif
+ 
+ void HOGDescriptor::detect(const Mat& img,
+     vector<Point>& hits, vector<double>& weights, double hitThreshold,
+@@ -884,6 +1077,14 @@
+     double rho = svmDetector.size() > dsize ? svmDetector[dsize] : 0;
+     vector<float> blockHist(blockHistogramSize);
+ 
++#ifdef USING_SSE2
++#ifdef WIN32
++		__declspec(align(16))
++#else
++		__attribute__ ((aligned(16)))
++#endif
++		    float partSum[4];
++#endif
+     for( size_t i = 0; i < nwindows; i++ )
+     {
+         Point pt0;
+@@ -917,13 +1113,45 @@
+             ippsDotProd_32f(vec,svmVec,blockHistogramSize,&partSum);
+             s += (double)partSum;
+ #else
++			
++#ifdef USING_SSE2
++			//pinched SSE2 code from openCV-2.4.5 on github
++			//I measured this as having a 2-3x speedup 			
++			//apparently the overall algorithm gets a 1.4x speedup
++			if (blockHistogramSize == 36){
++				//get another maybe 1.2x speedup if we unroll the loop for the special case where 
++				//blockHistogramSize == 36
++				s += classifySVMBlockWhenHistSzIs36(svmVec,vec);
++			}
++			else {
++				__m128 _vec = _mm_loadu_ps(vec);
++				__m128 _svmVec = _mm_loadu_ps(svmVec);
++				__m128 sum = _mm_mul_ps(_svmVec,_vec);
++				for( k = 4; k <= blockHistogramSize - 4; k += 4 ){
++					_vec = _mm_loadu_ps(vec + k);
++					_svmVec = _mm_loadu_ps(svmVec + k);
++					sum = _mm_add_ps(sum,_mm_mul_ps(_vec, _svmVec));
++					//maybe little point unrolling more than this as msvc is dumb at using xmm registers
++				}
++				_mm_store_ps(partSum,sum);
++				double t0 = partSum[0] + partSum[1];
++				double t1 = partSum[2] + partSum[3];
++				s += t0 + t1;
++				for( ; k < blockHistogramSize; k++ )
++					s += vec[k]*svmVec[k];
++			}
++#else
+             for( k = 0; k <= blockHistogramSize - 4; k += 4 )
+                 s += vec[k]*svmVec[k] + vec[k+1]*svmVec[k+1] +
+                     vec[k+2]*svmVec[k+2] + vec[k+3]*svmVec[k+3];
+-            for( ; k < blockHistogramSize; k++ )
++			for( ; k < blockHistogramSize; k++ )
+                 s += vec[k]*svmVec[k];
++#endif    
+ #endif
+         }
++			//Used to comment this out to return all window scores
++			//for FPPW histogram evaluation (the Dalal method)
++			//but setting hitThreshold to eg -10 would probably work too
+         if( s >= hitThreshold )
+         {
+             hits.push_back(pt0);
+@@ -1017,6 +1245,252 @@
+     Mutex* mtx;
+ };
+ 
++	//support function: TODO extend descriptor class with specfifc fpga/cpu stuff
++	Size HOGDescriptor::windowsInImageCells(Size imageSize, Size winStride, Size winSize) const
++	{
++		return Size((imageSize.width - winSize.width)/winStride.width +1,
++			(imageSize.height - winSize.height)/winStride.height +1);
++	}
++	//CB 15/4/12
++	//this should take a pointer to a Mat which has the cellhists, and return the blockhists
++	void HOGDescriptor::detectFromCells(const Mat& cell_hists,
++		vector<Point>& hits, vector<double>& weights, Size imsz, double hitThreshold, 
++		Size winStride, Size padding, const vector<Point>& locations) const
++	{
++		Mat_ <float> myBlockCache;
++		vector<float> blockData;
++		Size ncells;
++		int blockHistogramSize;
++		hits.clear();
++
++		if( svmDetector.empty() )
++			return;
++
++		//assert some shit
++		CV_Assert(cell_hists.type() == CV_32FC1);
++
++
++		//TODO move all of this to an init function, most of it comes from the cache anyway	
++		///////////////////////////////////////////////////////////////////////////////
++		Size cacheStride(gcd(winStride.width, blockStride.width),
++			gcd(winStride.height, blockStride.height));
++		size_t nwindows = locations.size();
++		//make sure imsz is the size before padding (ie 640*480)
++		padding.width = (int)alignSize(std::max(padding.width, 0), cacheStride.width);
++		padding.height = (int)alignSize(std::max(padding.height, 0), cacheStride.height);
++		Size paddedImgSize(imsz.width+ padding.width*2, imsz.height + padding.height*2);
++		if( winStride == Size() )
++			winStride = cellSize;
++
++		//from img rows and img cols, work out 
++		//size of block hists and make a simple cache this size
++		Size blockCacheSize = Size( // <-- there are  w x h blocks
++			(imsz.width  - blockSize.width  + blockStride.width) / blockStride.width,
++			(imsz.height - blockSize.height + blockStride.width) / blockStride.height);
++
++		ncells = Size(blockSize.width/cellSize.width, blockSize.height/cellSize.height);
++		//each block is this big:
++		blockHistogramSize = ncells.width*ncells.height*nbins;
++
++		myBlockCache.create(blockCacheSize.height, blockCacheSize.width*blockHistogramSize);
++		if( !nwindows )
++			nwindows = windowsInImageCells(paddedImgSize, winStride, winSize).area();
++
++		//descriptor info
++		size_t dsize = getDescriptorSize();
++		double rho = svmDetector.size() > dsize ? svmDetector[dsize] : 0;
++		Size nblocks = Size((winSize.width - blockSize.width)/blockStride.width + 1,
++			(winSize.height - blockSize.height)/blockStride.height + 1);
++		/////////////////////////////////////////////////////////////////////////////////////////////////
++
++		//for each output block
++		//grab 4x9 values
++		//normalise
++		//store in cache
++		//check we won't overflow first
++		CV_Assert( ((blockCacheSize.height +1) * (blockCacheSize.width +1) *  nbins) <= ( cell_hists.rows * cell_hists.cols));
++		for (int iy = 0; iy < blockCacheSize.height; iy++) {
++			for (int ix = 0; ix < blockCacheSize.width; ix ++) {
++				int ib;
++				//apparently faster way to access output mat
++				float* thisBlock = myBlockCache.ptr<float>(iy, ix * blockHistogramSize);
++
++				for (ib=0; ib< nbins; ib ++) thisBlock[             ib ] = cell_hists.ptr<float>()[ iy      * (blockCacheSize.width +1) * nbins +  ix      * nbins + ib]; //ix,   iy
++				for (ib=0; ib< nbins; ib ++) thisBlock[ (1*nbins) + ib ] = cell_hists.ptr<float>()[ iy      * (blockCacheSize.width +1) * nbins + (ix + 1) * nbins + ib]; //ix+1, iy
++				for (ib=0; ib< nbins; ib ++) thisBlock[ (2*nbins) + ib ] = cell_hists.ptr<float>()[(iy + 1) * (blockCacheSize.width +1) * nbins +  ix      * nbins + ib]; //ix,   iy+1
++				for (ib=0; ib< nbins; ib ++) thisBlock[ (3*nbins) + ib ] = cell_hists.ptr<float>()[(iy + 1) * (blockCacheSize.width +1) * nbins + (ix + 1) * nbins + ib]; //ix+1, iy+1
++
++				normalizeBlockHistogramFromCell(thisBlock,blockHistogramSize);
++			}
++		}
++
++		//testing code
++		static bool oneshot=false;
++		if (oneshot){
++			dumpCellHistMat(myBlockCache,CV_32FC1,"normalisedcpuhistsdump.txt",false);
++			oneshot=false;
++		}
++
++		//for each window
++		//get point at tl of window 
++		//for each block in window
++		//use points to tie cell hists to base pixels so pinning detections 
++		//to image is possible
++#ifdef USING_SSE2
++#ifdef WIN32
++		__declspec(align(16))
++#else
++		__attribute__ ((aligned(16)))
++#endif
++		    float partSum[4];
++#endif
++		for( size_t i = 0; i < nwindows; i++ )
++		{
++			Point pt0, pt, cellpt;
++			if( !locations.empty() )
++			{
++				pt0 = locations[i];
++				if( pt0.x < -padding.width || pt0.x > imsz.width + padding.width - winSize.width ||
++					pt0.y < -padding.height || pt0.y > imsz.height + padding.height - winSize.height )
++					continue;
++			}
++			else
++			{
++				//check all of this
++				//make sure we can fit a whole window in on BR from last point
++				pt0.y = (((int)i)/(blockCacheSize.width - nblocks.width +1)) * blockStride.height; 
++				pt0.x = (i%(blockCacheSize.width - nblocks.width +1)) * blockStride.width; 
++				CV_Assert(pt0.x % cacheStride.width == 0 && pt0.y % cacheStride.height == 0);
++				//CV_Assert((pt0.x + winSize.width <= imsz.width) && (pt0.y + winSize.height <= imsz.height));
++			}
++
++
++			double s = rho;
++			const float* svmVec = &svmDetector[0];
++			//get blocks from cache
++#ifdef HAVE_IPP
++			int j;
++#else
++			int j, k;
++#endif
++#ifndef USING_SSE2
++			//debug: open files here
++			static bool oneshot2=false;
++			FILE *fh, *fw;
++			if(oneshot2){
++				bool dumpToFile = true;
++				if (myBlockCache.type() !=CV_32FC1)
++					printf("Block histogram type is wrong. Specified type is &d and matrix type is  %d, isContinuous? %s\n",
++					CV_32FC1, myBlockCache.type(), myBlockCache.isContinuous()? "true" : "false");
++				if (dumpToFile)
++				{ 
++					char fhname[]= "svminput.txt";
++					char fwname[]= "svmweights.txt";
++					if ((fh= fopen(fhname,"w")) ==NULL)
++						printf("Failed opening histsdump file %s\n",fhname);
++					if ((fw= fopen(fwname,"w")) ==NULL)
++						printf("Failed opening histsdump file %s\n",fwname);
++				}
++			}
++#endif
++			for( j = 0; j < nblocks.area(); j++, svmVec += blockHistogramSize )
++			{
++				//This is the other way round from the GPU version
++				//but that's because the GPU weights get transposed in setSVMDetector
++				//before they get uploaded			
++				pt.x = (pt0.x + (j / nblocks.height) * blockStride.width);
++				pt.y = (pt0.y + (j % nblocks.height) * blockStride.height);
++				//now get block from window
++				cellpt.x = (pt.x / blockStride.width * blockHistogramSize);
++				cellpt.y = (pt.y / blockStride.height);
++				//removed j term  in cellpt.y as it was causing subtle havoc
++				float* vec = &myBlockCache(cellpt.y,cellpt.x);
++				//something screwy here in final 2 columns, FIXME
++
++#ifdef HAVE_IPP
++				Ipp32f partSum;
++				ippsDotProd_32f(vec,svmVec,blockHistogramSize,&partSum);
++				s += (double)partSum;
++#else
++#ifdef USING_SSE2
++				//pinched SSE2 code from openCV-2.4.5 on github
++				//I measured this as having a 2-3x speedup 			
++				//apparently the overall algorithm gets a 1.4x speedup
++				if (blockHistogramSize == 36){
++					//get another maybe 1.2x speedup if we unroll the loop for the special case where 
++					//blockHistogramSize == 36
++					s += classifySVMBlockWhenHistSzIs36(svmVec,vec);
++				}
++				else {
++					__m128 mv0 = _mm_loadu_ps(vec);	
++					__m128 ms0 = _mm_loadu_ps(svmVec);
++					__m128 sum = _mm_mul_ps(ms0,mv0);
++					__m128 mv1 = _mm_loadu_ps(vec + 4); //mvx: xmm vector n, msx: xmm support n, max: xmm accumulator n
++					__m128 ms1 = _mm_loadu_ps(svmVec +4);
++					__m128 ma1 = _mm_mul_ps(ms1,mv1); //seed sum and ma1
++
++					for( k = 8; k <= blockHistogramSize - 8; k += 8 ){
++						mv0 = _mm_loadu_ps(vec + k);
++						ms0 = _mm_loadu_ps(svmVec + k);
++						mv1 = _mm_loadu_ps(vec + k + 4);
++						ms1 = _mm_loadu_ps(svmVec + k + 4);
++						ma1 = _mm_add_ps(ma1,_mm_mul_ps(mv1, ms1));
++						sum = _mm_add_ps(sum,_mm_mul_ps(mv0, ms0));
++						
++						//TODO unroll more than this. msvc why wont you do this automatically??
++					}
++					sum = _mm_add_ps(sum,ma1); //gather at end
++					_mm_store_ps(partSum,sum);
++					double t0 = partSum[0] + partSum[1];
++					double t1 = partSum[2] + partSum[3];
++					s += t0 + t1;
++					for( ; k < blockHistogramSize; k++ )
++						s += vec[k]*svmVec[k];
++				}
++#else
++				for( k = 0; k <= blockHistogramSize - 4; k += 4 ){
++					s += vec[k]*svmVec[k] + vec[k+1]*svmVec[k+1] +
++						vec[k+2]*svmVec[k+2] + vec[k+3]*svmVec[k+3];
++					if (oneshot2){
++						fprintf(fh, "%f\n%f\n%f\n%f\n",vec[k],vec[k+1],vec[k+2],vec[k+3]);
++						fprintf(fw, "%f\n%f\n%f\n%f\n",svmVec[k],svmVec[k+1],svmVec[k+2],svmVec[k+3]);
++					}
++				}
++
++				for( ; k < blockHistogramSize; k++ ){
++					s += vec[k]*svmVec[k];
++					if (oneshot2){fprintf(fh, "%f\n",vec[k]); fprintf(fw, "%f\n",svmVec[k]);}
++				}
++
++#endif
++#endif
++			}
++#ifndef HAVE_IPP
++#ifndef USING_SSE2	
++			if (oneshot2){fclose(fh); fclose(fw);	oneshot2=false;	}
++#endif
++#endif
++			//Used to comment this out to return all window scores
++			//for FPPW histogram evaluation (the Dalal method)
++			//but setting hitThreshold to eg -10 would probably work too
++			if( s >= hitThreshold ) 
++			{
++				hits.push_back(pt0);
++				weights.push_back(s);
++			}
++		}
++
++	}
++
++	//version with weights returned
++	void HOGDescriptor::detectFromCells(const Mat& cellhists, vector<Point>& hits, Size imsz, double hitThreshold, 
++		Size winStride, Size padding, const vector<Point>& locations) const
++	{
++		vector<double> weightsV;
++		detectFromCells(cellhists, hits, weightsV, imsz, hitThreshold, winStride, padding, locations);
++	}
++
++
+ 
+ void HOGDescriptor::detectMultiScale(
+     const Mat& img, vector<Rect>& foundLocations, vector<double>& foundWeights,
+
+
+
+
+diff -ur opencv-2.4.4/modules/objdetect/src/matching.cpp opencv/modules/objdetect/src/matching.cpp
+--- opencv-2.4.4/modules/objdetect/src/matching.cpp	2013-03-01 15:44:17.000000000 +0000
++++ opencv/modules/objdetect/src/matching.cpp	2015-07-20 14:43:20.812460400 +0100
+@@ -1,6 +1,7 @@
+ #include "precomp.hpp"
+ #include "_lsvm_matching.h"
+ #include <stdio.h>
++#include <xmmintrin.h>
+ 
+ #ifndef max
+ #define max(a,b)            (((a) > (b)) ? (a) : (b))
+@@ -25,7 +26,7 @@
+ {
+     int n1, m1, n2, m2, p, /*size,*/ diff1, diff2;
+     int i1, i2, j1, j2, k;
+-    float tmp_f1, tmp_f2, tmp_f3, tmp_f4;
++    //float tmp_f1, tmp_f2, tmp_f3, tmp_f4;
+     float *pMap = NULL;
+     float *pH = NULL;
+ 
+@@ -38,15 +39,25 @@
+     diff1 = n1 - n2 + 1;
+     diff2 = m1 - m2 + 1;
+     //size = diff1 * diff2;
++	//really basic acceleration using xmm, gets maybe a 20% speedup
++	__m128  accumvec;
++	__m128 mapvec, hvec,mulresult;
++#ifdef WIN32
++	__declspec(align(16)) 
++#else
++	__attribute__ ((aligned(16)))
++#endif
++	    float tmp_f[4] = {0.f,0.f,0.f,0.f};
+     for (j1 = diff2 - 1; j1 >= 0; j1--)
+     {
+ 
+         for (i1 = diff1 - 1; i1 >= 0; i1--)
+         {
+-            tmp_f1 = 0.0f;
++           /* tmp_f1 = 0.0f;
+             tmp_f2 = 0.0f;
+             tmp_f3 = 0.0f;
+-            tmp_f4 = 0.0f;
++            tmp_f4 = 0.0f;*/
++			accumvec = _mm_setzero_ps();
+             for (i2 = 0; i2 < n2; i2++)
+             {
+                 for (j2 = 0; j2 < m2; j2++)
+@@ -56,34 +62,43 @@
+                     for (k = 0; k < p/4; k++)
+                     {
+ 
+-                        tmp_f1 += pMap[4*k]*pH[4*k];//sm2
++                        /*tmp_f1 += pMap[4*k]*pH[4*k];//sm2
+                         tmp_f2 += pMap[4*k+1]*pH[4*k+1];
+                         tmp_f3 += pMap[4*k+2]*pH[4*k+2];
+-                        tmp_f4 += pMap[4*k+3]*pH[4*k+3];
++                        tmp_f4 += pMap[4*k+3]*pH[4*k+3];*/
++						mapvec = _mm_loadu_ps(&pMap[4*k]);
++						hvec = _mm_loadu_ps(&pH[4*k]);
++						mulresult = _mm_mul_ps(mapvec,hvec);
++						accumvec = _mm_add_ps(accumvec,mulresult);
+                     }
+-
+-                    if (p%4==1)
+-                    {
+-                        tmp_f1 += pH[p-1]*pMap[p-1];
+-                    }
+-                    else
+-                    {
+-                        if (p%4==2)
+-                        {
+-                            tmp_f1 += pH[p-2]*pMap[p-2] + pH[p-1]*pMap[p-1];
+-                        }
+-                        else
+-                        {
+-                            if (p%4==3)
+-                            {
+-                                tmp_f1 += pH[p-3]*pMap[p-3] + pH[p-2]*pMap[p-2] + pH[p-1]*pMap[p-1];
+-                            }
+-                        }
+-                    }
+-
++					/*there is a way to handle the edge cases using SSE, but it relies on
++					1) either using masked loads (SSE4? AVX?) to prevent reading past the 
++					end of the array, or 2)reading 4 float values including past the end of 
++					the array and then masking them. cant figure out how to get a 128bit
++					binary mask of type __m128 rather than __m128i though, and cant seem 
++					to cast at all.*/
++					
++					// handle edge case individually
++					_mm_store_ps(tmp_f,accumvec);
++					switch(p%4){
++					case 1:
++						tmp_f[0] += pH[p-1]*pMap[p-1];
++						accumvec = _mm_load_ps(tmp_f);
++						break;
++					case 2:
++						tmp_f[0] += pH[p-2]*pMap[p-2] + pH[p-1]*pMap[p-1];
++						accumvec = _mm_load_ps(tmp_f);
++						break;
++					case 3:
++						tmp_f[0] += pH[p-3]*pMap[p-3] + pH[p-2]*pMap[p-2] + pH[p-1]*pMap[p-1];
++						accumvec = _mm_load_ps(tmp_f);
++						break;
++					default:
++						break;
++					}
+                 }
+             }
+-            f[i1 * diff2 + j1] = tmp_f1 + tmp_f2 + tmp_f3 + tmp_f4;//sm1
++            f[i1 * diff2 + j1] = tmp_f[0] +  tmp_f[1] +  tmp_f[2] +  tmp_f[3];//sm1
+         }
+     }
+     return LATENT_SVM_OK;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

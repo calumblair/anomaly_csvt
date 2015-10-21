@@ -1,0 +1,25 @@
+this holds all the application-level c++ code, cuda code and fpga interface stuff. its not using cmake for various reasons, but dealing with libraries, headers etc is easiest by modifying the opencv.props in vs2010. this supports 32bit builds and kind-of supports 64 with a bit of fiddling (check for stray /machine:x86 directions hiding in project configs). 
+
+everything should be cross platform except _maybe_ the millisecondTimer.
+
+dependencies: boost (used v1.49)
+opencv with my modifications to gpu and objdetect modules - this is needed both for fpga operation and gpu-only operation, as i modified some of the hog stuff to work better.
+https://github.com/Itseez/opencv/archive/2.4.4.zip
+
+windriver (v 10.10 works ok)
+
+the matlab stuff needs mexopencv.
+
+todos: put the fpga interface stuff inside a library, then another for the fpga-hog as it's used by several projects.
+
+opencv_dir: set to root of opencv install dir
+mexopencv_path:
+matlab_path: set to root of matlab install
+boost_path: set to root of boost install
+
+patch opencv with  patch -p1 <../opencv-2.4.4_patch.diff
+if cuda version >=6 apply this fix: https://github.com/Itseez/opencv/pull/1762/files
+using v6 or above not recommended: nvcuvenc not present
+
+cuda_path: set to root of cuda in program files (should be automatic?)
+

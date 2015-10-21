@@ -1,0 +1,148 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="..\src\stdafx.cpp" />
+    <ClCompile Include="..\src\frankenTracking.cpp">
+      <Filter>host</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\utilities\displayUtilities.cpp">
+      <Filter>host</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\clustering.cpp">
+      <Filter>host</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\heisenFrame.cpp">
+      <Filter>host</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\unsupervisedHeatmap.cpp">
+      <Filter>host</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\bayesianAnomalyOracle.cpp">
+      <Filter>host</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\algorithmWrapper.cpp">
+      <Filter>host</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\fpgaInterfaceCore.c">
+      <Filter>fpga</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\profiling.cpp">
+      <Filter>host</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\tracker.cpp">
+      <Filter>host</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\fpgaHOG.cpp">
+      <Filter>fpga</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\backgroundSubtractor.cpp">
+      <Filter>host</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\carHOG.cpp">
+      <Filter>host</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\matchDetections.cpp">
+      <Filter>host</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\fpgaInterface.cpp">
+      <Filter>fpga</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\sceneHomography.cpp">
+      <Filter>host</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\choosemapping.cpp">
+      <Filter>host</Filter>
+    </ClCompile>
+    <ClCompile Include="..\windriver-$(PlatformArchitecture)\bmd_lib.c">
+      <Filter>windriver</Filter>
+    </ClCompile>
+    <ClCompile Include="..\windriver-$(PlatformArchitecture)\samples\shared\diag_lib.c">
+      <Filter>windriver</Filter>
+    </ClCompile>
+    <ClCompile Include="..\windriver-$(PlatformArchitecture)\samples\shared\wdc_diag_lib.c">
+      <Filter>windriver</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <Text Include="ReadMe.txt" />
+    <Text Include="..\inc\HOGCarDetector26_20130815.txt">
+      <Filter>data</Filter>
+    </Text>
+    <Text Include="..\inc\HOGCarDetector27_20130815.txt">
+      <Filter>data</Filter>
+    </Text>
+    <Text Include="..\inc\mydescriptor22.txt">
+      <Filter>data</Filter>
+    </Text>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="headers">
+      <UniqueIdentifier>{bb2d59d2-3061-4ad1-98b6-f92fffa360b9}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="host">
+      <UniqueIdentifier>{cde3f780-b446-4c57-80e6-4e25ac9eb047}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="fpga">
+      <UniqueIdentifier>{9cd25284-32cd-45a0-962a-4451a4302a90}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="data">
+      <UniqueIdentifier>{c6c5b529-4b13-4e6c-ba5e-833fb3d976f2}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="windriver">
+      <UniqueIdentifier>{38275091-8248-4dd4-b367-e5513d11758e}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\inc\acceleratedAlgorithm.h">
+      <Filter>headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\inc\acceleratedDetectors.h">
+      <Filter>headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\inc\bayesianAnomalyOracle.h">
+      <Filter>headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\inc\cb_opencv.h">
+      <Filter>headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\inc\clustering.h">
+      <Filter>headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\inc\display.h">
+      <Filter>headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\inc\fpga.h">
+      <Filter>headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\inc\fpgaImageSize.h">
+      <Filter>headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\inc\fpgaInterface.h">
+      <Filter>headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\inc\heisenFrame.h">
+      <Filter>headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\inc\mogProcessor.h">
+      <Filter>headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\inc\profiling.h">
+      <Filter>headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\inc\stdafx.h">
+      <Filter>headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\inc\targetver.h">
+      <Filter>headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\inc\tracking.h">
+      <Filter>headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\inc\trackingApp.h">
+      <Filter>headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\inc\unsupervisedHeatmap.h">
+      <Filter>headers</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>

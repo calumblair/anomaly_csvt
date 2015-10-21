@@ -1,0 +1,61 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+   <ImportGroup Label="PropertySheets" />
+   <PropertyGroup Label="UserMacros">
+   <!--debug suffix-->
+	<BoostDebugSuffix Condition="'$(Configuration)'=='Debug'">-gd</BoostDebugSuffix>
+    <BoostDebugSuffix Condition="'$(Configuration)'!='Debug'"></BoostDebugSuffix>
+    <DebugSuffix Condition="'$(Configuration)'=='Debug'">d</DebugSuffix>
+    <DebugSuffix Condition="'$(Configuration)'!='Debug'"></DebugSuffix>
+	<OpenCVVSVersionPath Condition="'$(PlatformToolsetVersion)'=='120'">12</OpenCVVSVersionPath>
+	<OpenCvVersion>2410</OpenCvVersion>
+	<BoostVersion>1_55</BoostVersion>
+  </PropertyGroup>
+  <PropertyGroup>
+    <ExecutablePath>.;(NVTOOLSEXT_PATH)\bin\$(Platform);$(OpenCV_DIR)\bin;$(CUDA_PATH)\bin;$(ExecutablePath)</ExecutablePath>
+  </PropertyGroup>
+  <PropertyGroup>
+    <IncludePath>..\inc;.;..\windriver-$(PlatformArchitecture);..\windriver-$(PlatformArchitecture)\include;$(NVTOOLSEXT_PATH)\include;$(NVCUDASAMPLES_ROOT)\common\inc;$(CUDA_PATH)\include;$(OpenCV_DIR)\include;$(boost_path);$(IncludePath)</IncludePath>
+  </PropertyGroup>
+  <PropertyGroup>
+	 <LibraryPath>$(NVTOOLSEXT_PATH)\lib\$(Platform);$(CUDA_PATH)\lib\$(Platform);$(boost_path)\lib;$(boost_path)\lib$(PlatformArchitecture)-msvc-$(MSBuildToolsVersion);$(OpenCV_DIR)\$(Platform)\vs$(OpenCVVSVersionPath)\bin;$(OpenCV_DIR)\$(Platform)\vc$(OpenCVVSVersionPath)\lib;$(OpenCV_DIR)\lib;$(OpenCV_DIR)\bin\$(Configuration);$(LibraryPath)</LibraryPath>
+  </PropertyGroup>
+  <PropertyGroup>
+    <SourcePath>..\inc;$(SourcePath)</SourcePath>
+  </PropertyGroup>
+  <ItemDefinitionGroup Label="UserDefs" />
+  <ItemDefinitionGroup>
+    <CudaCompile>
+      <PtxAsOptionV>false</PtxAsOptionV>
+      <CodeGeneration>compute_12,sm_12; compute_20,sm_21</CodeGeneration>
+      <Include>..\inc</Include>
+    </CudaCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>
+opencv_core$(OpenCvVersion)$(DebugSuffix).lib;
+opencv_imgproc$(OpenCvVersion)$(DebugSuffix).lib;
+opencv_highgui$(OpenCvVersion)$(DebugSuffix).lib;
+opencv_gpu$(OpenCvVersion)$(DebugSuffix).lib;
+opencv_calib3d$(OpenCvVersion)$(DebugSuffix).lib;
+opencv_objdetect$(OpenCvVersion)$(DebugSuffix).lib;
+opencv_contrib$(OpenCvVersion)$(DebugSuffix).lib;
+opencv_nonfree$(OpenCvVersion)$(DebugSuffix).lib;
+opencv_ml$(OpenCvVersion)$(DebugSuffix).lib;
+opencv_features2d$(OpenCvVersion)$(DebugSuffix).lib;
+opencv_video$(OpenCvVersion)$(DebugSuffix).lib;
+cudart.lib;
+nvtoolsext$(PlatformArchitecture)_1.lib;
+libboost_filesystem-vc$(PlatformToolsetVersion)-mt$(BoostDebugSuffix)-$(BoostVersion).lib;
+libboost_exception-vc$(PlatformToolsetVersion)-mt$(BoostDebugSuffix)-$(BoostVersion).lib;
+libboost_system-vc$(PlatformToolsetVersion)-mt$(BoostDebugSuffix)-$(BoostVersion).lib;
+%(AdditionalDependencies)
+		</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup />
+</Project>

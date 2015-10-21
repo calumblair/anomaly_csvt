@@ -1,0 +1,13 @@
+/Release
+/Build (GNU)
+/windriver-32
+/windriver-32
+*.d
+*.o
+*.suo
+*.dll
+*.sys
+*.sdf
+*/x64/*
+*/ipch/*
+
